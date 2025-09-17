@@ -9,6 +9,40 @@ require('dotenv').config();
 const { Booking } = require('../models/bookingModels');
 const { Driver, Passenger } = require('../models/userModels');
 
+// In-memory storage for booking notes (last N notes per booking)
+const bookingNotes = new Map();
+const MAX_NOTES_PER_BOOKING = 50;
+
+// Helper: join user to booking tunnel rooms for their active bookings
+async function joinBookingRooms(socket, user) {
+  if (!user || !user.id) return;
+  
+  try {
+    const userType = String(user.type).toLowerCase();
+    let query = {};
+    
+    if (userType === 'driver') {
+      query = { driverId: String(user.id), status: { $in: ['accepted', 'ongoing'] } };
+    } else if (userType === 'passenger') {
+      query = { passengerId: String(user.id), status: { $in: ['requested', 'accepted', 'ongoing'] } };
+    }
+    
+    const activeBookings = await Booking.find(query).select('_id').lean();
+    activeBookings.forEach(booking => {
+      const room = `booking:${String(booking._id)}`;
+      socket.join(room);
+      console.log(`${userType} ${user.id} joined booking room ${room}`);
+    });
+  } catch (err) {
+    console.error('Error joining booking rooms:', err);
+  }
+}
+
+// Helper: get stored notes for a booking
+function getStoredNotes(bookingId) {
+  return bookingNotes.get(String(bookingId)) || [];
+}
+
 // Helper: find all active drivers
 async function findActiveDrivers() {
   return Driver.find({ available: true }).lean();
@@ -85,12 +119,18 @@ function attachSocketHandlers(io) {
             socket.join(room);
             socket.join('drivers');
             console.log(`Driver ${driverId} joined room ${room} and 'drivers'`);
+            // Join booking tunnel rooms for active bookings
+            await joinBookingRooms(socket, user);
           }
         } else if (normalizedType === 'passenger') {
           const passengerId = await resolvePassengerIdFromToken(decoded);
           user = { type: 'passenger', id: passengerId || (decoded.id ? String(decoded.id) : undefined), name: decoded.name, phone: decoded.phone || decoded.phoneNumber || decoded.mobile };
           socket.user = user;
-          if (user.id) socket.join(`passenger:${user.id}`);
+          if (user.id) {
+            socket.join(`passenger:${user.id}`);
+            // Join booking tunnel rooms for active bookings
+            await joinBookingRooms(socket, user);
+          }
         } else {
           throw new Error('Unsupported user type');
         }
@@ -121,6 +161,12 @@ function attachSocketHandlers(io) {
 
         // Save booking
         const booking = await Booking.create(bookingData);
+        const bookingId = String(booking._id);
+
+        // Join passenger to booking tunnel room
+        const bookingRoom = `booking:${bookingId}`;
+        socket.join(bookingRoom);
+        console.log(`Passenger ${passengerId} joined booking room ${bookingRoom}`);
 
         // Find active drivers nearby
         const drivers = await findActiveDrivers();
@@ -133,22 +179,30 @@ function attachSocketHandlers(io) {
           ) / 1000
         ) <= radiusKm);
 
-        const bookingJson = booking.toObject ? booking.toObject() : booking;
-        const bookingPayload = {
-          ...bookingJson,
-          passenger: {
-            id: passengerId,
-            name: socket.user && socket.user.name ? socket.user.name : undefined,
-            phone: socket.user && socket.user.phone ? socket.user.phone : undefined
+        // Create patch for booking creation
+        const patch = {
+          bookingId,
+          patch: {
+            status: 'requested',
+            passengerId,
+            vehicleType: booking.vehicleType,
+            pickup: booking.pickup,
+            dropoff: booking.dropoff,
+            passenger: {
+              id: passengerId,
+              name: socket.user && socket.user.name ? socket.user.name : undefined,
+              phone: socket.user && socket.user.phone ? socket.user.phone : undefined
+            }
           }
         };
 
+        // Emit patch to nearby drivers via booking tunnel
         nearbyDrivers.forEach(d => {
           const driverRoomId = String(d._id || d.id);
-          io.to(`driver:${driverRoomId}`).emit('booking:new', bookingPayload);
+          io.to(`driver:${driverRoomId}`).emit('booking:new', patch);
         });
-        // Broadcast to all drivers as a fallback to avoid ID mismatches between JWT and DB
-        io.to('drivers').emit('booking:new', bookingPayload);
+        // Broadcast to all drivers as a fallback
+        io.to('drivers').emit('booking:new', patch);
 
       } catch (err) {
         console.error('Error handling booking_request:', err);
@@ -162,18 +216,18 @@ function attachSocketHandlers(io) {
         const bookingIdRaw = data.bookingId;
         const authUser = socket.user;
         if (!authUser || String(authUser.type).toLowerCase() !== 'driver' || !authUser.id) {
-          return socket.emit('booking_error', { message: 'Unauthorized: driver token required' });
+          return socket.emit('booking_error', { message: 'Unauthorized: driver token required', bookingId: bookingIdRaw });
         }
 
         if (!bookingIdRaw) {
-          return socket.emit('booking_error', { message: 'bookingId is required' });
+          return socket.emit('booking_error', { message: 'bookingId is required', bookingId: bookingIdRaw });
         }
 
         let bookingObjectId;
         try {
           bookingObjectId = new mongoose.Types.ObjectId(String(bookingIdRaw));
         } catch (_) {
-          return socket.emit('booking_error', { message: 'Invalid bookingId' });
+          return socket.emit('booking_error', { message: 'Invalid bookingId', bookingId: bookingIdRaw });
         }
 
         // Atomically accept only if still requested
@@ -185,26 +239,47 @@ function attachSocketHandlers(io) {
         ).lean();
 
         if (!accepted) {
-          return socket.emit('booking_error', { message: 'Booking already accepted by another driver or not found' });
+          return socket.emit('booking_error', { message: 'Booking already accepted by another driver or not found', bookingId: bookingIdRaw });
         }
 
-        const driverInfo = {
-          id: String(authUser.id),
-          name: authUser.name,
-          phone: authUser.phone,
-          vehicleType: authUser.vehicleType,
+        const bookingId = String(accepted._id);
+        const bookingRoom = `booking:${bookingId}`;
+
+        // Join driver to booking tunnel room
+        socket.join(bookingRoom);
+        console.log(`Driver ${authUser.id} joined booking room ${bookingRoom}`);
+
+        // Create patch for booking acceptance
+        const patch = {
+          bookingId,
+          patch: {
+            status: 'accepted',
+            driverId: String(authUser.id),
+            acceptedAt: now.toISOString(),
+            driver: {
+              id: String(authUser.id),
+              name: authUser.name,
+              phone: authUser.phone,
+              vehicleType: authUser.vehicleType,
+            }
+          }
         };
 
-        const bookingPayload = { ...accepted, driver: driverInfo };
+        // Emit patch to booking tunnel room
+        io.to(bookingRoom).emit('booking:update', patch);
 
-        if (accepted.passengerId) {
-          io.to(`passenger:${String(accepted.passengerId)}`).emit('booking:update', bookingPayload);
-        }
+        // Send confirmation to driver
+        io.to(`driver:${String(authUser.id)}`).emit('booking:accepted', patch);
 
-        io.to(`driver:${String(authUser.id)}`).emit('booking:accepted', bookingPayload);
       } catch (err) {
         console.error('Error handling booking_accept:', err);
-        socket.emit('booking_error', { message: 'Failed to accept booking' });
+        // Attempt to include bookingId if present in the incoming payload
+        try {
+          const data = typeof payload === 'string' ? JSON.parse(payload) : (payload || {});
+          return socket.emit('booking_error', { message: 'Failed to accept booking', bookingId: data && data.bookingId });
+        } catch (_) {
+          return socket.emit('booking_error', { message: 'Failed to accept booking' });
+        }
       }
     });
 
@@ -216,18 +291,18 @@ function attachSocketHandlers(io) {
         const reason = data.reason;
         const authUser = socket.user;
         if (!authUser || !authUser.type) {
-          return socket.emit('booking_error', { message: 'Unauthorized: user token required' });
+          return socket.emit('booking_error', { message: 'Unauthorized: user token required', bookingId: bookingIdRaw });
         }
 
         if (!bookingIdRaw) {
-          return socket.emit('booking_error', { message: 'bookingId is required' });
+          return socket.emit('booking_error', { message: 'bookingId is required', bookingId: bookingIdRaw });
         }
 
         let bookingObjectId;
         try {
           bookingObjectId = new mongoose.Types.ObjectId(String(bookingIdRaw));
         } catch (_) {
-          return socket.emit('booking_error', { message: 'Invalid bookingId' });
+          return socket.emit('booking_error', { message: 'Invalid bookingId', bookingId: bookingIdRaw });
         }
 
         const canceledBy = String(authUser.type).toLowerCase() === 'driver' ? 'driver' : 'passenger';
@@ -239,30 +314,183 @@ function attachSocketHandlers(io) {
         ).lean();
 
         if (!updated) {
-          return socket.emit('booking_error', { message: 'Booking not found' });
+          return socket.emit('booking_error', { message: 'Booking not found', bookingId: bookingIdRaw });
         }
 
-        const payloadOut = { ...updated, canceledBy };
+        const bookingId = String(updated._id);
+        const bookingRoom = `booking:${bookingId}`;
 
-        if (updated.passengerId) {
-          io.to(`passenger:${String(updated.passengerId)}`).emit('booking:update', payloadOut);
-        }
-        if (updated.driverId) {
-          io.to(`driver:${String(updated.driverId)}`).emit('booking:update', payloadOut);
-        }
+        // Create patch for booking cancellation
+        const patch = {
+          bookingId,
+          patch: {
+            status: 'canceled',
+            canceledBy,
+            canceledReason: reason
+          }
+        };
 
-        // Confirmation to actor
+        // Emit patch to booking tunnel room
+        io.to(bookingRoom).emit('booking:update', patch);
+
+        // Send confirmation to actor
         const actorRoom = canceledBy === 'driver' ? `driver:${String(authUser.id)}` : `passenger:${String(authUser.id)}`;
-        io.to(actorRoom).emit('booking:cancelled', payloadOut);
+        io.to(actorRoom).emit('booking:cancelled', patch);
+
       } catch (err) {
         console.error('Error handling booking_cancel:', err);
-        socket.emit('booking_error', { message: 'Failed to cancel booking' });
+        // Attempt to include bookingId if present in the incoming payload
+        try {
+          const data = typeof payload === 'string' ? JSON.parse(payload) : (payload || {});
+          return socket.emit('booking_error', { message: 'Failed to cancel booking', bookingId: data && data.bookingId });
+        } catch (_) {
+          return socket.emit('booking_error', { message: 'Failed to cancel booking' });
+        }
       }
     });
 
-    // Optional: disconnect log
+    // --- Handle booking notes from drivers or passengers ---
+    socket.on('booking_note', async (payload) => {
+      try {
+        const data = typeof payload === 'string' ? JSON.parse(payload) : (payload || {});
+        const bookingIdRaw = data.bookingId;
+        const message = data.message;
+        const authUser = socket.user;
+
+        if (!authUser || !authUser.type) {
+          return socket.emit('booking_error', { message: 'Unauthorized: user token required', bookingId: bookingIdRaw });
+        }
+
+        if (!bookingIdRaw) {
+          return socket.emit('booking_error', { message: 'bookingId is required', bookingId: bookingIdRaw });
+        }
+
+        if (!message || typeof message !== 'string' || message.trim().length === 0) {
+          return socket.emit('booking_error', { message: 'Message is required and must be non-empty', bookingId: bookingIdRaw });
+        }
+
+        let bookingObjectId;
+        try {
+          bookingObjectId = new mongoose.Types.ObjectId(String(bookingIdRaw));
+        } catch (_) {
+          return socket.emit('booking_error', { message: 'Invalid bookingId', bookingId: bookingIdRaw });
+        }
+
+        // Find the booking to verify authorization
+        const booking = await Booking.findById(bookingObjectId).lean();
+        if (!booking) {
+          return socket.emit('booking_error', { message: 'Booking not found', bookingId: bookingIdRaw });
+        }
+
+        // Verify the sender is either the driver or passenger of this booking
+        const userType = String(authUser.type).toLowerCase();
+        const isAuthorized = 
+          (userType === 'driver' && booking.driverId && String(booking.driverId) === String(authUser.id)) ||
+          (userType === 'passenger' && booking.passengerId && String(booking.passengerId) === String(authUser.id));
+
+        if (!isAuthorized) {
+          return socket.emit('booking_error', { message: 'Unauthorized: you are not the driver or passenger of this booking', bookingId: bookingIdRaw });
+        }
+
+        // Create note object
+        const note = {
+          bookingId: String(bookingIdRaw),
+          sender: userType,
+          message: message.trim(),
+          timestamp: new Date().toISOString()
+        };
+
+        // Store note in memory (last N notes per booking)
+        const bookingIdStr = String(bookingIdRaw);
+        if (!bookingNotes.has(bookingIdStr)) {
+          bookingNotes.set(bookingIdStr, []);
+        }
+        const notes = bookingNotes.get(bookingIdStr);
+        notes.push(note);
+        
+        // Keep only the last N notes
+        if (notes.length > MAX_NOTES_PER_BOOKING) {
+          notes.splice(0, notes.length - MAX_NOTES_PER_BOOKING);
+        }
+
+        // Emit to booking tunnel room
+        io.to(`booking:${bookingIdStr}`).emit('booking:note', note);
+
+      } catch (err) {
+        console.error('Error handling booking_note:', err);
+        // Attempt to include bookingId if present in the incoming payload
+        try {
+          const data = typeof payload === 'string' ? JSON.parse(payload) : (payload || {});
+          return socket.emit('booking_error', { message: 'Failed to send note', bookingId: data && data.bookingId });
+        } catch (_) {
+          return socket.emit('booking_error', { message: 'Failed to send note' });
+        }
+      }
+    });
+
+    // --- Fetch stored notes for a booking (for late-joining sockets) ---
+    socket.on('booking_notes_fetch', async (payload) => {
+      try {
+        const data = typeof payload === 'string' ? JSON.parse(payload) : (payload || {});
+        const bookingIdRaw = data.bookingId;
+        const authUser = socket.user;
+
+        if (!authUser || !authUser.type) {
+          return socket.emit('booking_error', { message: 'Unauthorized: user token required', bookingId: bookingIdRaw });
+        }
+
+        if (!bookingIdRaw) {
+          return socket.emit('booking_error', { message: 'bookingId is required', bookingId: bookingIdRaw });
+        }
+
+        let bookingObjectId;
+        try {
+          bookingObjectId = new mongoose.Types.ObjectId(String(bookingIdRaw));
+        } catch (_) {
+          return socket.emit('booking_error', { message: 'Invalid bookingId', bookingId: bookingIdRaw });
+        }
+
+        // Find the booking to verify authorization
+        const booking = await Booking.findById(bookingObjectId).lean();
+        if (!booking) {
+          return socket.emit('booking_error', { message: 'Booking not found', bookingId: bookingIdRaw });
+        }
+
+        // Verify the user is either the driver or passenger of this booking
+        const userType = String(authUser.type).toLowerCase();
+        const isAuthorized = 
+          (userType === 'driver' && booking.driverId && String(booking.driverId) === String(authUser.id)) ||
+          (userType === 'passenger' && booking.passengerId && String(booking.passengerId) === String(authUser.id));
+
+        if (!isAuthorized) {
+          return socket.emit('booking_error', { message: 'Unauthorized: you are not the driver or passenger of this booking', bookingId: bookingIdRaw });
+        }
+
+        // Get stored notes
+        const notes = getStoredNotes(bookingIdRaw);
+        socket.emit('booking:notes_history', { bookingId: String(bookingIdRaw), notes });
+
+      } catch (err) {
+        console.error('Error handling booking_notes_fetch:', err);
+        // Attempt to include bookingId if present in the incoming payload
+        try {
+          const data = typeof payload === 'string' ? JSON.parse(payload) : (payload || {});
+          return socket.emit('booking_error', { message: 'Failed to fetch notes', bookingId: data && data.bookingId });
+        } catch (_) {
+          return socket.emit('booking_error', { message: 'Failed to fetch notes' });
+        }
+      }
+    });
+
+    // Handle disconnect - leave booking rooms
     socket.on('disconnect', () => {
       console.log(`Socket disconnected: ${socket.id}`);
+      
+      // Note: Socket.IO automatically removes sockets from all rooms on disconnect
+      // This is just for logging purposes
+      if (socket.user && socket.user.id) {
+        console.log(`${socket.user.type} ${socket.user.id} disconnected and left all rooms`);
+      }
     });
   });
 }
