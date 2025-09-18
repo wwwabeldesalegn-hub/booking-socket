@@ -102,27 +102,23 @@ exports.create = async (req, res) => {
       updatedAt: booking.updatedAt
     };
     
-    // Broadcast to nearby drivers (by vehicle type)
+    // Broadcast to nearest drivers (by vehicle type) using nearby service and socket helper
     try {
-      const { Driver } = require('../models/userModels');
-      const geolib = require('geolib');
-      const drivers = await Driver.find({ available: true, ...(vehicleType ? { vehicleType } : {}) }).lean();
-      const radiusKm = parseFloat(process.env.BROADCAST_RADIUS_KM || '5');
-      const within = drivers.filter(d => d.lastKnownLocation && (
-        geolib.getDistance(
-          { latitude: d.lastKnownLocation.latitude, longitude: d.lastKnownLocation.longitude },
-          { latitude: pickup.latitude, longitude: pickup.longitude }
-        ) / 1000
-      ) <= radiusKm);
+      const { driverByLocationAndVehicleType } = require('../services/nearbyDrivers');
+      const { sendMessageToSocketId } = require('../sockets/utils');
+      const nearest = await driverByLocationAndVehicleType({
+        latitude: pickup.latitude,
+        longitude: pickup.longitude,
+        vehicleType: vehicleType,
+        radiusKm: parseFloat(process.env.BROADCAST_RADIUS_KM || '5'),
+        limit: 5
+      });
+      const targets = (nearest || []).map(x => x.driver);
       const payload = { ...data };
       const { broadcast } = require('../sockets');
-      // Aggregate broadcast for dashboards
-      broadcast('booking:new:broadcast', { ...payload, targetedCount: within.length });
-      // Targeted emits
-      const { getIo } = require('../sockets/utils');
-      const io = getIo && getIo();
-      if (io) within.forEach(d => io.to(`driver:${String(d._id)}`).emit('booking:new', payload));
-    } catch (_) {}
+      broadcast('booking:new:broadcast', { ...payload, targetedCount: targets.length });
+      targets.forEach(d => sendMessageToSocketId(`driver:${String(d._id)}`, { event: 'booking:new', data: payload }));
+    } catch (e) { console.error('Broadcast to nearest drivers failed:', e); }
 
     return res.status(201).json(data);
   } catch (e) { return res.status(500).json({ message: `Failed to create booking: ${e.message}` }); }

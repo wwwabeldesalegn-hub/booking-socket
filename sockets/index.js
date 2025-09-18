@@ -9,6 +9,8 @@ require('dotenv').config();
 // Models
 const { Booking, Live } = require('../models/bookingModels');
 const { Driver, Passenger } = require('../models/userModels');
+const { driverByLocationAndVehicleType } = require('../services/nearbyDrivers');
+const { sendMessageToSocketId, setIo } = require('./utils');
 
 // In-memory storage for booking notes (last N notes per booking)
 const bookingNotes = new Map();
@@ -103,6 +105,7 @@ function attachSocketHandlers(io) {
     console.warn('[attachSocketHandlers] Socket server already attached. Overwriting ioRef.');
   }
   ioRef = io;
+  try { setIo(io); } catch (_) {}
 
   io.on('connection', async (socket) => {
     console.log(`[connection] New socket connected: ${socket.id}`);
@@ -239,13 +242,27 @@ function attachSocketHandlers(io) {
           }
         };
 
-        nearbyDrivers.forEach(d => {
-          const driverRoomId = String(d._id);
-          io.to(`driver:${driverRoomId}`).emit('booking:new', patch);
-          console.log(`[booking_request] Emitted 'booking:new' to driver:${driverRoomId}`);
-        });
-        io.to('drivers').emit('booking:new', patch);
-        console.log('[booking_request] Emitted "booking:new" to all drivers fallback');
+        try {
+          // Use nearby driver service limited to 5 nearest drivers by vehicle type
+          const nearest = await driverByLocationAndVehicleType({
+            latitude: booking.pickup.latitude,
+            longitude: booking.pickup.longitude,
+            vehicleType: booking.vehicleType,
+            radiusKm: parseFloat(process.env.BROADCAST_RADIUS_KM || '5'),
+            limit: 5
+          });
+          const targets = (nearest || []).map(x => x.driver);
+          if (targets.length === 0) {
+            console.log('[booking_request] No nearby drivers found for broadcast');
+          }
+          targets.forEach(d => {
+            const driverRoomId = String(d._id);
+            sendMessageToSocketId(`driver:${driverRoomId}`, { event: 'booking:new', data: patch });
+          });
+        } catch (e) {
+          console.error('[booking_request] Nearby driver service failed, fallback to broadcasting to drivers room', e);
+          io.to('drivers').emit('booking:new', patch);
+        }
 
       } catch (err) {
         console.error('[booking_request] Error:', err);
@@ -334,7 +351,7 @@ function attachSocketHandlers(io) {
               ) / 1000
             ) <= radiusKm
           ));
-          nearby.forEach(d => io.to(`driver:${String(d._id)}`).emit('booking:removed', { bookingId }));
+          nearby.forEach(d => sendMessageToSocketId(`driver:${String(d._id)}`, { event: 'booking:removed', data: { bookingId } }));
         } catch (e) {
           console.error('[booking_accept] booking:removed notify error:', e);
         }
@@ -511,9 +528,9 @@ function attachSocketHandlers(io) {
         };
 
         if (bookingIdRaw) {
-          io.to(`booking:${String(bookingIdRaw)}`).emit('booking:driver_location_update', payloadOut);
+          sendMessageToSocketId(`booking:${String(bookingIdRaw)}`, { event: 'booking:driver_location_update', data: payloadOut });
         }
-        io.to(`driver:${String(authUser.id)}`).emit('booking:driver_location_update', payloadOut);
+        sendMessageToSocketId(`driver:${String(authUser.id)}`, { event: 'booking:driver_location_update', data: payloadOut });
       } catch (err) {
         console.error('[booking:driver_location_update] Error:', err);
         socket.emit('booking_error', { message: 'Failed to process location update', source: 'booking:driver_location_update' });
@@ -570,7 +587,7 @@ function attachSocketHandlers(io) {
           return socket.emit('booking_error', { message: 'Only assigned driver can send ETA', source: 'booking:ETA_update' });
         }
         const out = { bookingId: String(booking._id), etaMinutes, message, driverId: String(authUser.id), timestamp: new Date().toISOString() };
-        io.to(`booking:${String(booking._id)}`).emit('booking:ETA_update', out);
+        sendMessageToSocketId(`booking:${String(booking._id)}`, { event: 'booking:ETA_update', data: out });
       } catch (err) {
         console.error('[booking:ETA_update] Error:', err);
         socket.emit('booking_error', { message: 'Failed to process ETA update', source: 'booking:ETA_update' });
@@ -605,9 +622,9 @@ function attachSocketHandlers(io) {
 
         const bookingRoom = `booking:${String(booking._id)}`;
         const patch = { bookingId: String(booking._id), patch: { status: 'completed', completedAt: booking.completedAt.toISOString() } };
-        io.to(bookingRoom).emit('booking:update', patch);
-        io.to(bookingRoom).emit('booking:completed', { bookingId: String(booking._id) });
-        io.to(`driver:${String(authUser.id)}`).emit('booking:completed', { bookingId: String(booking._id) });
+        sendMessageToSocketId(bookingRoom, { event: 'booking:update', data: patch });
+        sendMessageToSocketId(bookingRoom, { event: 'booking:completed', data: { bookingId: String(booking._id) } });
+        sendMessageToSocketId(`driver:${String(authUser.id)}`, { event: 'booking:completed', data: { bookingId: String(booking._id) } });
       } catch (err) {
         console.error('[booking:completed] Error:', err);
         socket.emit('booking_error', { message: 'Failed to complete booking', source: 'booking:completed' });
@@ -626,7 +643,7 @@ function attachSocketHandlers(io) {
         if (available == null) return socket.emit('booking_error', { message: 'available boolean is required', source: 'driver:availability' });
         await Driver.findByIdAndUpdate(authUser.id, { available });
         socket.user.available = available;
-        io.to(`driver:${String(authUser.id)}`).emit('driver:availability', { driverId: String(authUser.id), available });
+        sendMessageToSocketId(`driver:${String(authUser.id)}`, { event: 'driver:availability', data: { driverId: String(authUser.id), available } });
       } catch (err) {
         console.error('[driver:availability] Error:', err);
         socket.emit('booking_error', { message: 'Failed to update availability', source: 'driver:availability' });
@@ -666,7 +683,7 @@ function attachSocketHandlers(io) {
         }
         await booking.save();
         const room = `booking:${String(booking._id)}`;
-        io.to(room).emit('booking:rating', { bookingId: String(booking._id), userType, rating, feedback });
+        sendMessageToSocketId(room, { event: 'booking:rating', data: { bookingId: String(booking._id), userType, rating, feedback } });
       } catch (err) {
         console.error('[booking:rating] Error:', err);
         socket.emit('booking_error', { message: 'Failed to submit rating', source: 'booking:rating' });
