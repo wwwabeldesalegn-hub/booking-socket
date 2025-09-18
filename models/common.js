@@ -4,6 +4,8 @@ const WalletSchema = new mongoose.Schema({
   userId: { type: String, required: true, index: true },
   role: { type: String, enum: ['passenger','driver'], required: true, index: true },
   balance: { type: Number, default: 0 },
+  totalEarnings: { type: Number, default: 0 },
+  currency: { type: String, default: 'ETB' }
 }, { timestamps: true, toJSON: { versionKey: false }, toObject: { versionKey: false } });
 
 const TransactionSchema = new mongoose.Schema({

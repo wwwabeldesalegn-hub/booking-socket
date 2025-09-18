@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const ctrl = require('../../controllers/driver.controller');
+const walletCtrl = require('../../controllers/driverWallet.controller');
 const { authenticate, authorize } = require('../../middleware/auth');
 
 // Remove driver creation via API
@@ -11,6 +12,10 @@ router.get('/:id', authenticate, authorize('admin','staff'), ctrl.get);
 // Driver self-service (id inferred from token; param ignored)
 router.post('/:id/availability', authenticate, authorize('driver'), ctrl.setAvailability);
 router.post('/:id/location', authenticate, authorize('driver'), ctrl.updateLocation);
+// Driver wallet endpoints
+router.get('/:id/wallet', authenticate, authorize('driver','admin','superadmin'), walletCtrl.getWallet);
+router.post('/:id/wallet/adjust', authenticate, authorize('admin','superadmin'), walletCtrl.adjustBalance);
+router.get('/:id/wallet/transactions', authenticate, authorize('driver','admin','superadmin'), walletCtrl.listTransactions);
 // Map external user service id to internal driver
 router.post('/:id/set-external-id', authenticate, authorize('admin','staff'), async (req, res) => {
   try {

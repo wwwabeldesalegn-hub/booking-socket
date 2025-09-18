@@ -421,6 +421,25 @@ exports.lifecycle = async (req, res) => {
           commissionPercentage: commissionRate
         });
         
+        // Update driver wallet: increment balance and totalEarnings by netEarnings
+        try {
+          const { Wallet, Transaction } = require('../models/common');
+          await Wallet.updateOne(
+            { userId: String(booking.driverId), role: 'driver' },
+            { $inc: { balance: netEarnings, totalEarnings: netEarnings } },
+            { upsert: true }
+          );
+          await Transaction.create({
+            userId: String(booking.driverId),
+            role: 'driver',
+            amount: netEarnings,
+            type: 'credit',
+            method: booking.paymentMethod || 'cash',
+            status: 'success',
+            metadata: { bookingId: String(booking._id), reason: 'Trip earnings' }
+          });
+        } catch (_) {}
+
         // Create admin earnings record
         await AdminEarnings.create({
           bookingId: booking._id,

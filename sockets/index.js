@@ -615,6 +615,31 @@ function attachSocketHandlers(io) {
         if (!booking.fareFinal) booking.fareFinal = booking.fareEstimated;
         await booking.save();
 
+        // Update driver wallet for earnings
+        try {
+          const { Wallet, Transaction } = require('../models/common');
+          const grossFare = booking.fareFinal || booking.fareEstimated || 0;
+          const { Commission } = require('../models/commission');
+          const commission = await Commission.findOne({ isActive: true }).sort({ createdAt: -1 });
+          const commissionRate = commission ? commission.percentage : 15;
+          const commissionAmount = (grossFare * commissionRate) / 100;
+          const netEarnings = grossFare - commissionAmount;
+          await Wallet.updateOne(
+            { userId: String(authUser.id), role: 'driver' },
+            { $inc: { balance: netEarnings, totalEarnings: netEarnings } },
+            { upsert: true }
+          );
+          await Transaction.create({
+            userId: String(authUser.id),
+            role: 'driver',
+            amount: netEarnings,
+            type: 'credit',
+            method: booking.paymentMethod || 'cash',
+            status: 'success',
+            metadata: { bookingId: String(booking._id), reason: 'Trip earnings (socket)' }
+          });
+        } catch (e) { logger.error('[booking:completed] wallet update failed:', e); }
+
         // Make driver available again
         try { await Driver.findByIdAndUpdate(authUser.id, { available: true }); } catch (_) {}
 
