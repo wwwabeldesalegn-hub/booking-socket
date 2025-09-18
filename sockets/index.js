@@ -7,7 +7,7 @@ const { getDriverById } = require('../integrations/userServiceClient');
 require('dotenv').config();
 
 // Models
-const { Booking } = require('../models/bookingModels');
+const { Booking, Live } = require('../models/bookingModels');
 const { Driver, Passenger } = require('../models/userModels');
 
 // In-memory storage for booking notes (last N notes per booking)
@@ -48,6 +48,9 @@ function getStoredNotes(bookingId) {
 async function findActiveDrivers() {
   return Driver.find({ available: true }).lean();
 }
+
+// Throttle map for live location updates per driver
+const lastLocationUpdateAtByDriver = new Map();
 
 // Resolve a canonical driver document from token claims
 async function resolveDriverFromToken(decoded) {
@@ -315,6 +318,27 @@ function attachSocketHandlers(io) {
         io.to(`driver:${String(authUser.id)}`).emit('booking:accepted', patch);
         console.log(`[booking_accept] Emitted 'booking:update' and 'booking:accepted' for booking ${bookingId}`);
 
+        // Notify other nearby drivers to remove this booking from their lists
+        try {
+          const drivers = await findActiveDrivers();
+          const radiusKm = parseFloat(process.env.RADIUS_KM || process.env.BROADCAST_RADIUS_KM || '5');
+          const vehicleType = accepted.vehicleType;
+          const nearby = drivers.filter(d => (
+            d && d._id && String(d._id) !== String(authUser.id) &&
+            d.lastKnownLocation &&
+            (!vehicleType || String(d.vehicleType || '').toLowerCase() === String(vehicleType || '').toLowerCase()) &&
+            (
+              geolib.getDistance(
+                { latitude: d.lastKnownLocation.latitude, longitude: d.lastKnownLocation.longitude },
+                { latitude: accepted.pickup?.latitude, longitude: accepted.pickup?.longitude }
+              ) / 1000
+            ) <= radiusKm
+          ));
+          nearby.forEach(d => io.to(`driver:${String(d._id)}`).emit('booking:removed', { bookingId }));
+        } catch (e) {
+          console.error('[booking_accept] booking:removed notify error:', e);
+        }
+
       } catch (err) {
         console.error('[booking_accept] Error:', err);
       }
@@ -428,6 +452,224 @@ function attachSocketHandlers(io) {
 
       } catch (err) {
         console.error('[booking_notes_fetch] Error:', err);
+      }
+    });
+
+    // --- booking:driver_location_update ---
+    socket.on('booking:driver_location_update', async (payload) => {
+      try {
+        const authUser = socket.user;
+        if (!authUser || String(authUser.type).toLowerCase() !== 'driver') {
+          return socket.emit('booking_error', { message: 'Unauthorized: driver token required', source: 'booking:driver_location_update' });
+        }
+
+        const data = typeof payload === 'string' ? JSON.parse(payload) : (payload || {});
+        const latitude = data.latitude != null ? parseFloat(data.latitude) : NaN;
+        const longitude = data.longitude != null ? parseFloat(data.longitude) : NaN;
+        const bookingIdRaw = data.bookingId;
+        const timestamp = data.timestamp ? new Date(data.timestamp) : new Date();
+
+        if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) {
+          return socket.emit('booking_error', { message: 'Valid latitude and longitude are required', source: 'booking:driver_location_update' });
+        }
+
+        const throttleMs = parseInt(process.env.LOCATION_UPDATE_THROTTLE_MS || '3000', 10);
+        const lastAt = lastLocationUpdateAtByDriver.get(String(authUser.id)) || 0;
+        const nowMs = Date.now();
+        if (nowMs - lastAt < throttleMs) {
+          return; // silently drop to throttle
+        }
+        lastLocationUpdateAtByDriver.set(String(authUser.id), nowMs);
+
+        // Persist live location
+        let passengerId = undefined;
+        if (bookingIdRaw) {
+          try {
+            const b = await Booking.findById(bookingIdRaw).select({ passengerId: 1 }).lean();
+            passengerId = b ? String(b.passengerId) : undefined;
+          } catch (_) {}
+        }
+        try {
+          await Live.create({
+            driverId: String(authUser.id),
+            passengerId: passengerId,
+            latitude,
+            longitude,
+            status: 'moving',
+            locationType: 'current',
+            bookingId: bookingIdRaw ? new mongoose.Types.ObjectId(String(bookingIdRaw)) : undefined,
+            timestamp
+          });
+        } catch (e) {}
+
+        const payloadOut = {
+          driverId: String(authUser.id),
+          latitude,
+          longitude,
+          timestamp: timestamp.toISOString(),
+          bookingId: bookingIdRaw ? String(bookingIdRaw) : undefined
+        };
+
+        if (bookingIdRaw) {
+          io.to(`booking:${String(bookingIdRaw)}`).emit('booking:driver_location_update', payloadOut);
+        }
+        io.to(`driver:${String(authUser.id)}`).emit('booking:driver_location_update', payloadOut);
+      } catch (err) {
+        console.error('[booking:driver_location_update] Error:', err);
+        socket.emit('booking_error', { message: 'Failed to process location update', source: 'booking:driver_location_update' });
+      }
+    });
+
+    // --- booking:status_request ---
+    socket.on('booking:status_request', async (payload) => {
+      try {
+        const data = typeof payload === 'string' ? JSON.parse(payload) : (payload || {});
+        const bookingIdRaw = data.bookingId;
+        if (!bookingIdRaw) {
+          return socket.emit('booking_error', { message: 'bookingId is required', source: 'booking:status_request' });
+        }
+        let booking = null;
+        try {
+          booking = await Booking.findById(bookingIdRaw).lean();
+        } catch (_) {}
+        if (!booking) {
+          return socket.emit('booking_error', { message: 'Booking not found', bookingId: bookingIdRaw, source: 'booking:status_request' });
+        }
+        socket.emit('booking:status', {
+          bookingId: String(booking._id),
+          status: booking.status,
+          driverId: booking.driverId,
+          passengerId: booking.passengerId,
+          vehicleType: booking.vehicleType,
+          pickup: booking.pickup,
+          dropoff: booking.dropoff
+        });
+      } catch (err) {
+        console.error('[booking:status_request] Error:', err);
+        socket.emit('booking_error', { message: 'Failed to fetch booking status', source: 'booking:status_request' });
+      }
+    });
+
+    // --- booking:ETA_update ---
+    socket.on('booking:ETA_update', async (payload) => {
+      try {
+        const authUser = socket.user;
+        if (!authUser || String(authUser.type).toLowerCase() !== 'driver') {
+          return socket.emit('booking_error', { message: 'Unauthorized: driver token required', source: 'booking:ETA_update' });
+        }
+        const data = typeof payload === 'string' ? JSON.parse(payload) : (payload || {});
+        const bookingIdRaw = data.bookingId;
+        const etaMinutes = data.etaMinutes != null ? parseInt(data.etaMinutes, 10) : undefined;
+        const message = data.message || undefined;
+        if (!bookingIdRaw || !Number.isFinite(etaMinutes)) {
+          return socket.emit('booking_error', { message: 'bookingId and etaMinutes are required', source: 'booking:ETA_update' });
+        }
+        const booking = await Booking.findById(bookingIdRaw).lean();
+        if (!booking) return socket.emit('booking_error', { message: 'Booking not found', source: 'booking:ETA_update' });
+        if (String(booking.driverId || '') !== String(authUser.id)) {
+          return socket.emit('booking_error', { message: 'Only assigned driver can send ETA', source: 'booking:ETA_update' });
+        }
+        const out = { bookingId: String(booking._id), etaMinutes, message, driverId: String(authUser.id), timestamp: new Date().toISOString() };
+        io.to(`booking:${String(booking._id)}`).emit('booking:ETA_update', out);
+      } catch (err) {
+        console.error('[booking:ETA_update] Error:', err);
+        socket.emit('booking_error', { message: 'Failed to process ETA update', source: 'booking:ETA_update' });
+      }
+    });
+
+    // --- booking:completed ---
+    socket.on('booking:completed', async (payload) => {
+      try {
+        const authUser = socket.user;
+        if (!authUser || String(authUser.type).toLowerCase() !== 'driver') {
+          return socket.emit('booking_error', { message: 'Unauthorized: driver token required', source: 'booking:completed' });
+        }
+        const data = typeof payload === 'string' ? JSON.parse(payload) : (payload || {});
+        const bookingIdRaw = data.bookingId;
+        if (!bookingIdRaw) return socket.emit('booking_error', { message: 'bookingId is required', source: 'booking:completed' });
+
+        const booking = await Booking.findOne({ _id: bookingIdRaw, driverId: String(authUser.id) });
+        if (!booking) return socket.emit('booking_error', { message: 'Booking not found or not assigned to you', source: 'booking:completed' });
+
+        // Update booking status
+        booking.status = 'completed';
+        booking.completedAt = new Date();
+        if (!booking.fareFinal) booking.fareFinal = booking.fareEstimated;
+        await booking.save();
+
+        // Make driver available again
+        try { await Driver.findByIdAndUpdate(authUser.id, { available: true }); } catch (_) {}
+
+        // Stop tracking
+        try { const positionUpdateService = require('../services/positionUpdate'); positionUpdateService.stopTracking(booking._id.toString()); } catch (_) {}
+
+        const bookingRoom = `booking:${String(booking._id)}`;
+        const patch = { bookingId: String(booking._id), patch: { status: 'completed', completedAt: booking.completedAt.toISOString() } };
+        io.to(bookingRoom).emit('booking:update', patch);
+        io.to(bookingRoom).emit('booking:completed', { bookingId: String(booking._id) });
+        io.to(`driver:${String(authUser.id)}`).emit('booking:completed', { bookingId: String(booking._id) });
+      } catch (err) {
+        console.error('[booking:completed] Error:', err);
+        socket.emit('booking_error', { message: 'Failed to complete booking', source: 'booking:completed' });
+      }
+    });
+
+    // --- driver:availability ---
+    socket.on('driver:availability', async (payload) => {
+      try {
+        const authUser = socket.user;
+        if (!authUser || String(authUser.type).toLowerCase() !== 'driver') {
+          return socket.emit('booking_error', { message: 'Unauthorized: driver token required', source: 'driver:availability' });
+        }
+        const data = typeof payload === 'string' ? JSON.parse(payload) : (payload || {});
+        const available = typeof data.available === 'boolean' ? data.available : undefined;
+        if (available == null) return socket.emit('booking_error', { message: 'available boolean is required', source: 'driver:availability' });
+        await Driver.findByIdAndUpdate(authUser.id, { available });
+        socket.user.available = available;
+        io.to(`driver:${String(authUser.id)}`).emit('driver:availability', { driverId: String(authUser.id), available });
+      } catch (err) {
+        console.error('[driver:availability] Error:', err);
+        socket.emit('booking_error', { message: 'Failed to update availability', source: 'driver:availability' });
+      }
+    });
+
+    // --- booking:rating (optional) ---
+    socket.on('booking:rating', async (payload) => {
+      try {
+        const authUser = socket.user;
+        const data = typeof payload === 'string' ? JSON.parse(payload) : (payload || {});
+        const bookingIdRaw = data.bookingId;
+        const rating = data.rating != null ? parseInt(data.rating, 10) : undefined;
+        const feedback = data.feedback || undefined;
+        if (!bookingIdRaw || !Number.isFinite(rating) || rating < 1 || rating > 5) {
+          return socket.emit('booking_error', { message: 'bookingId and rating (1-5) are required', source: 'booking:rating' });
+        }
+        const booking = await Booking.findById(bookingIdRaw);
+        if (!booking) return socket.emit('booking_error', { message: 'Booking not found', source: 'booking:rating' });
+        if (booking.status !== 'completed') return socket.emit('booking_error', { message: 'Can only rate after trip completion', source: 'booking:rating' });
+
+        const userType = String(authUser?.type || '').toLowerCase();
+        if (userType === 'passenger') {
+          if (String(booking.passengerId) !== String(authUser.id)) {
+            return socket.emit('booking_error', { message: 'Only the passenger can rate the driver', source: 'booking:rating' });
+          }
+          booking.driverRating = rating;
+          if (feedback) booking.driverComment = feedback;
+        } else if (userType === 'driver') {
+          if (String(booking.driverId) !== String(authUser.id)) {
+            return socket.emit('booking_error', { message: 'Only the assigned driver can rate the passenger', source: 'booking:rating' });
+          }
+          booking.passengerRating = rating;
+          if (feedback) booking.passengerComment = feedback;
+        } else {
+          return socket.emit('booking_error', { message: 'Unsupported user type for rating', source: 'booking:rating' });
+        }
+        await booking.save();
+        const room = `booking:${String(booking._id)}`;
+        io.to(room).emit('booking:rating', { bookingId: String(booking._id), userType, rating, feedback });
+      } catch (err) {
+        console.error('[booking:rating] Error:', err);
+        socket.emit('booking_error', { message: 'Failed to submit rating', source: 'booking:rating' });
       }
     });
 
