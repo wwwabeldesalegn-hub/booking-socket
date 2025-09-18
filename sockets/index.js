@@ -35,10 +35,10 @@ async function joinBookingRooms(socket, user) {
     activeBookings.forEach(booking => {
       const room = `booking:${String(booking._id)}`;
       socket.join(room);
-      console.log(`[joinBookingRooms] ${userType} ${user.id} joined booking room ${room}`);
+      logger.info(`[joinBookingRooms] ${userType} ${user.id} joined booking room ${room}`);
     });
   } catch (err) {
-    console.error('[joinBookingRooms] Error:', err);
+    logger.error('[joinBookingRooms] Error:', err);
   }
 }
 
@@ -200,7 +200,8 @@ function attachSocketHandlers(io) {
     socket.on('booking_request', async (payload) => {
       logger.info('[booking_request] Payload received:', payload);
       try {
-        const bookingData = typeof payload === 'string' ? JSON.parse(payload) : (payload || {});
+        const parsed = typeof payload === 'string' ? JSON.parse(payload) : (payload || {});
+        const bookingData = (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) ? parsed : {};
         const authUser = socket.user;
         logger.info('[booking_request] Authenticated user:', authUser);
 
@@ -213,7 +214,8 @@ function attachSocketHandlers(io) {
         bookingData.vehicleType = bookingData.vehicleType || 'mini';
         bookingData.status = bookingData.status || 'requested';
 
-        const booking = await Booking.create(bookingData);
+        logger.info('[booking_request] Booking.create data:', bookingData);
+        const booking = await Booking.create({ ...bookingData });
         logger.info('[booking_request] Booking created:', booking._id);
 
         const bookingRoom = `booking:${booking._id}`;
@@ -245,7 +247,7 @@ function attachSocketHandlers(io) {
 
         try {
           // Use nearby driver service limited to 5 nearest drivers by vehicle type
-          const nearest = await driverByLocationAndVehicleType({
+        const nearest = await driverByLocationAndVehicleType({
             latitude: booking.pickup.latitude,
             longitude: booking.pickup.longitude,
             vehicleType: booking.vehicleType,
@@ -295,6 +297,7 @@ function attachSocketHandlers(io) {
         }
 
         const now = new Date();
+        logger.info('[booking_accept] findOneAndUpdate query/update:', { _id: String(bookingObjectId), status: 'requested' }, { status: 'accepted', driverId: String(authUser.id), acceptedAt: now });
         const accepted = await Booking.findOneAndUpdate(
           { _id: bookingObjectId, status: 'requested' },
           { $set: { status: 'accepted', driverId: String(authUser.id), acceptedAt: now } },
@@ -389,6 +392,7 @@ function attachSocketHandlers(io) {
 
         const canceledBy = String(authUser.type).toLowerCase() === 'driver' ? 'driver' : 'passenger';
 
+        logger.info('[booking_cancel] findOneAndUpdate query/update:', { _id: String(bookingObjectId) }, { status: 'canceled', canceledBy, canceledReason: reason });
         const updated = await Booking.findOneAndUpdate(
           { _id: bookingObjectId },
           { $set: { status: 'canceled', canceledBy, canceledReason: reason } },
@@ -508,7 +512,7 @@ function attachSocketHandlers(io) {
           } catch (_) {}
         }
         try {
-          await Live.create({
+          const liveDoc = {
             driverId: String(authUser.id),
             passengerId: passengerId,
             latitude,
@@ -517,7 +521,9 @@ function attachSocketHandlers(io) {
             locationType: 'current',
             bookingId: bookingIdRaw ? new mongoose.Types.ObjectId(String(bookingIdRaw)) : undefined,
             timestamp
-          });
+          };
+          logger.info('[booking:driver_location_update] Live.create data:', liveDoc);
+          await Live.create(liveDoc);
         } catch (e) {}
 
         const payloadOut = {
@@ -582,6 +588,7 @@ function attachSocketHandlers(io) {
         if (!bookingIdRaw || !Number.isFinite(etaMinutes)) {
           return socket.emit('booking_error', { message: 'bookingId and etaMinutes are required', source: 'booking:ETA_update' });
         }
+        logger.info('[booking:ETA_update] Booking.findById:', bookingIdRaw);
         const booking = await Booking.findById(bookingIdRaw).lean();
         if (!booking) return socket.emit('booking_error', { message: 'Booking not found', source: 'booking:ETA_update' });
         if (String(booking.driverId || '') !== String(authUser.id)) {
@@ -606,6 +613,7 @@ function attachSocketHandlers(io) {
         const bookingIdRaw = data.bookingId;
         if (!bookingIdRaw) return socket.emit('booking_error', { message: 'bookingId is required', source: 'booking:completed' });
 
+        logger.info('[booking:completed] Booking.findOne:', { _id: bookingIdRaw, driverId: String(authUser.id) });
         const booking = await Booking.findOne({ _id: bookingIdRaw, driverId: String(authUser.id) });
         if (!booking) return socket.emit('booking_error', { message: 'Booking not found or not assigned to you', source: 'booking:completed' });
 
@@ -624,12 +632,13 @@ function attachSocketHandlers(io) {
           const commissionRate = commission ? commission.percentage : 15;
           const commissionAmount = (grossFare * commissionRate) / 100;
           const netEarnings = grossFare - commissionAmount;
+          logger.info('[booking:completed] Wallet.updateOne inc:', { userId: String(authUser.id), role: 'driver', inc: { balance: netEarnings, totalEarnings: netEarnings } });
           await Wallet.updateOne(
             { userId: String(authUser.id), role: 'driver' },
             { $inc: { balance: netEarnings, totalEarnings: netEarnings } },
             { upsert: true }
           );
-          await Transaction.create({
+          const txDoc = {
             userId: String(authUser.id),
             role: 'driver',
             amount: netEarnings,
@@ -637,7 +646,9 @@ function attachSocketHandlers(io) {
             method: booking.paymentMethod || 'cash',
             status: 'success',
             metadata: { bookingId: String(booking._id), reason: 'Trip earnings (socket)' }
-          });
+          };
+          logger.info('[booking:completed] Transaction.create data:', txDoc);
+          await Transaction.create(txDoc);
         } catch (e) { logger.error('[booking:completed] wallet update failed:', e); }
 
         // Make driver available again
@@ -667,6 +678,7 @@ function attachSocketHandlers(io) {
         const data = typeof payload === 'string' ? JSON.parse(payload) : (payload || {});
         const available = typeof data.available === 'boolean' ? data.available : undefined;
         if (available == null) return socket.emit('booking_error', { message: 'available boolean is required', source: 'driver:availability' });
+        logger.info('[driver:availability] Driver.findByIdAndUpdate:', { id: String(authUser.id), available });
         await Driver.findByIdAndUpdate(authUser.id, { available });
         socket.user.available = available;
         sendMessageToSocketId(`driver:${String(authUser.id)}`, { event: 'driver:availability', data: { driverId: String(authUser.id), available } });
