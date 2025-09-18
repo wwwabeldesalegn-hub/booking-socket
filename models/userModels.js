@@ -31,7 +31,7 @@ const DriverSchema = new mongoose.Schema({
   phone: { type: String },
   email: { type: String },
   password: { type: String },
-  vehicleType: { type: String, enum: ['mini', 'sedan', 'van'], default: 'mini' },
+  vehicleType: { type: String, enum: ['mini', 'sedan', 'suv', 'mpv'] },
   available: { type: Boolean, default: false },
   lastKnownLocation: { 
     latitude: Number, 
@@ -118,4 +118,3 @@ module.exports = {
   Staff: mongoose.model('Staff', StaffSchema),
   Admin: mongoose.model('Admin', AdminSchema)
 };
-
