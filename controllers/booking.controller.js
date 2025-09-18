@@ -102,23 +102,21 @@ exports.create = async (req, res) => {
       updatedAt: booking.updatedAt
     };
     
-    // Broadcast to nearest drivers (by vehicle type) using nearby service and socket helper
+    // Broadcast to nearest passengers (top 5)
     try {
-      const { driverByLocationAndVehicleType } = require('../services/nearbyDrivers');
+      const { nearestPassengers } = require('../services/nearbyPassengers');
       const { sendMessageToSocketId } = require('../sockets/utils');
-      const nearest = await driverByLocationAndVehicleType({
+      const nearest = await nearestPassengers({
         latitude: pickup.latitude,
         longitude: pickup.longitude,
-        vehicleType: vehicleType,
-        radiusKm: parseFloat(process.env.BROADCAST_RADIUS_KM || '5'),
         limit: 5
       });
-      const targets = (nearest || []).map(x => x.driver);
+      const targets = (nearest || []).map(x => x.passenger);
       const payload = { ...data };
       const { broadcast } = require('../sockets');
-      broadcast('booking:new:broadcast', { ...payload, targetedCount: targets.length });
-      targets.forEach(d => sendMessageToSocketId(`driver:${String(d._id)}`, { event: 'booking:new', data: payload }));
-    } catch (e) { console.error('Broadcast to nearest drivers failed:', e); }
+      broadcast('booking:new:broadcast', { ...payload, targetedCount: targets.length, target: 'passengers' });
+      targets.forEach(p => sendMessageToSocketId(`passenger:${String(p._id)}`, { event: 'booking:new', data: payload }));
+    } catch (e) { console.error('Broadcast to nearest passengers failed:', e); }
 
     return res.status(201).json(data);
   } catch (e) { return res.status(500).json({ message: `Failed to create booking: ${e.message}` }); }
