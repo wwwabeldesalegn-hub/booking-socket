@@ -119,7 +119,13 @@ function attachSocketHandlers(io) {
         if (normalizedType === 'driver') {
           const driverDoc = await resolveDriverFromToken(decoded);
           const driverId = driverDoc ? String(driverDoc._id) : (decoded.id ? String(decoded.id) : undefined);
-          user = { type: 'driver', id: driverId, vehicleType: driverDoc?.vehicleType, name: driverDoc?.name || decoded.name, phone: driverDoc?.phone || (decoded.phone || decoded.phoneNumber || decoded.mobile) };
+          user = { 
+            type: 'driver', 
+            id: driverId, 
+            vehicleType: (driverDoc && driverDoc.vehicleType) ? driverDoc.vehicleType : decoded.vehicleType, 
+            name: driverDoc?.name || decoded.name, 
+            phone: driverDoc?.phone || (decoded.phone || decoded.phoneNumber || decoded.mobile) 
+          };
           // Persist auth token on socket for later service calls
           socket.authToken = rawToken;
 
