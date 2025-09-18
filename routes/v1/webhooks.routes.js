@@ -1,6 +1,8 @@
 const express = require('express');
 const router = express.Router();
 
+const logger = require('../../utils/logger');
+
 // Public webhook echo endpoint
 router.post('/public', (req, res) => {
   return res.json({
@@ -73,11 +75,11 @@ router.post('/payment', async (req, res) => {
     } catch (_) { /* optional */ }
 
     // Log event for audit
-    console.log('[webhook:payment] Simplified payload:', simplified);
+    logger.info('[webhook:payment] Simplified payload:', simplified);
 
     return res.status(200).json({ ok: true });
   } catch (e) {
-    console.error('[webhook:payment] Error:', e);
+    logger.error('[webhook:payment] Error:', e);
     return res.status(500).json({ message: 'Webhook processing failed' });
   }
 });

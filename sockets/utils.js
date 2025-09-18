@@ -1,4 +1,5 @@
 let ioRef = null;
+const logger = require('../utils/logger');
 
 function setIo(io) {
   ioRef = io;
@@ -12,13 +13,13 @@ const sendMessageToSocketId = (socketId, messageObject) => {
   const io = ioRef;
   if (io) {
     try {
-      console.log('message sent to: ', socketId);
+      logger.info('message sent to: ', socketId);
       io.to(socketId).emit(messageObject.event, messageObject.data);
     } catch (e) {
-      console.error('Failed to send message to socket', socketId, e);
+      logger.error('Failed to send message to socket', socketId, e);
     }
   } else {
-    console.log('Socket.io not initialized.');
+    logger.warn('Socket.io not initialized.');
   }
 };
 
