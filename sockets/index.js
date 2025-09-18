@@ -2,6 +2,7 @@ let ioRef;
 const jwt = require('jsonwebtoken');
 const geolib = require('geolib');
 const mongoose = require('mongoose');
+const axios = require('axios');
 const { getDriverById } = require('../integrations/userServiceClient');
 require('dotenv').config();
 
@@ -128,6 +129,21 @@ function attachSocketHandlers(io) {
           };
           // Persist auth token on socket for later service calls
           socket.authToken = rawToken;
+
+          // Store default nearby search params from handshake
+          const q = socket.handshake.query || {};
+          const defLat = q.latitude != null ? parseFloat(q.latitude) : undefined;
+          const defLng = q.longitude != null ? parseFloat(q.longitude) : undefined;
+          const defRadius = q.radiusKm != null ? parseFloat(q.radiusKm) : undefined;
+          const defVehicleType = q.vehicleType || undefined;
+          const defLimit = q.limit != null ? parseInt(q.limit, 10) : undefined;
+          socket.nearbyDefaults = {
+            latitude: Number.isFinite(defLat) ? defLat : undefined,
+            longitude: Number.isFinite(defLng) ? defLng : undefined,
+            radiusKm: Number.isFinite(defRadius) ? defRadius : undefined,
+            vehicleType: defVehicleType || user.vehicleType,
+            limit: Number.isFinite(defLimit) ? defLimit : undefined,
+          };
 
           // If vehicleType or vehicle details are missing, hydrate from User Service
           if (driverId && (!user.vehicleType || !user.carPlate || !user.carModel || !user.carColor)) {
@@ -412,6 +428,54 @@ function attachSocketHandlers(io) {
 
       } catch (err) {
         console.error('[booking_notes_fetch] Error:', err);
+      }
+    });
+
+    // --- booking:nearby ---
+    socket.on('booking:nearby', async (payload) => {
+      try {
+        const authUser = socket.user;
+        if (!authUser || String(authUser.type).toLowerCase() !== 'driver') {
+          return socket.emit('booking_error', { message: 'Unauthorized: driver token required', source: 'booking:nearby' });
+        }
+
+        const data = typeof payload === 'string' ? JSON.parse(payload) : (payload || {});
+        const defaults = socket.nearbyDefaults || {};
+        const latitude = data.latitude != null ? parseFloat(data.latitude) : defaults.latitude;
+        const longitude = data.longitude != null ? parseFloat(data.longitude) : defaults.longitude;
+        const radiusKm = data.radiusKm != null ? parseFloat(data.radiusKm) : (defaults.radiusKm || 5);
+        const limit = data.limit != null ? parseInt(data.limit, 10) : (defaults.limit || 20);
+        const vehicleType = data.vehicleType || defaults.vehicleType || authUser.vehicleType;
+
+        if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) {
+          return socket.emit('booking_error', { message: 'Valid latitude and longitude are required', source: 'booking:nearby' });
+        }
+        if (!vehicleType) {
+          return socket.emit('booking_error', { message: 'vehicleType is required', source: 'booking:nearby' });
+        }
+
+        // Build base URL to call the existing REST endpoint
+        const baseUrl = (process.env.BOOKING_BASE_URL || process.env.BASE_URL || `http://localhost:${process.env.BOOKING_PORT || process.env.PORT || 4000}`).replace(/\/$/, '');
+        const url = `${baseUrl}/v1/bookings/nearby`;
+        const headers = {};
+        if (socket.authToken) headers['Authorization'] = socket.authToken.startsWith('Bearer ') ? socket.authToken : `Bearer ${socket.authToken}`;
+
+        const response = await axios.get(url, {
+          headers,
+          params: { latitude, longitude, radiusKm, vehicleType, limit: Math.min(Math.max(limit, 1), 100) }
+        });
+
+        let items = Array.isArray(response.data) ? response.data : [];
+        // Enforce vehicleType filter server-side as well
+        items = items.filter(it => String(it.vehicleType || '').toLowerCase() === String(vehicleType).toLowerCase());
+        // Apply limit defensively
+        items = items.slice(0, Math.min(Math.max(limit, 1), 100));
+
+        // Emit back only to the requesting driver socket
+        socket.emit('booking:nearby', { bookings: items, meta: { count: items.length, vehicleType, radiusKm } });
+      } catch (err) {
+        console.error('[booking:nearby] Error:', err);
+        socket.emit('booking_error', { message: 'Failed to fetch nearby bookings', source: 'booking:nearby' });
       }
     });
 
